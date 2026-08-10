@@ -51,6 +51,7 @@ HIGH_WATER = os.path.join(WORK, ".downloaded.json")
 DEST = os.path.join(HERE, "Raw")
 EXTRACT = os.path.join(HERE, "Extracted")
 SPOTIFY_TOKEN = os.path.join(HERE, ".spotify_token.json")
+MANIFEST = os.path.join(HERE, ".playlists.json")
 REDIRECT_PORT = 8888
 REDIRECT_URI = f"http://127.0.0.1:{REDIRECT_PORT}/callback"
 SCOPES = "playlist-modify-private playlist-read-private ugc-image-upload"
@@ -269,12 +270,19 @@ def spotify_api(method, path, token, **kw):
     return r.json() if r.content else None
 
 
-def inverted_cover_bytes(cover_path):
+def inverted_cover_bytes(cover_path, max_bytes=256 * 1024):
     img = Image.open(cover_path).convert("RGB")
-    img.thumbnail((640, 640))
     inv = ImageOps.invert(img)
+    for size in (640, 512, 384, 300):
+        im = inv.copy()
+        im.thumbnail((size, size))
+        for quality in (80, 65, 50, 35):
+            buf = io.BytesIO()
+            im.save(buf, format="JPEG", quality=quality)
+            if buf.tell() < max_bytes:
+                return base64.b64encode(buf.getvalue())
     buf = io.BytesIO()
-    inv.save(buf, format="JPEG", quality=92)
+    inv.resize((300, 300)).save(buf, "JPEG", quality=30)
     return base64.b64encode(buf.getvalue())
 
 
@@ -310,6 +318,10 @@ def spotify_step():
     me = spotify_api("GET", "/v1/me", token)
     print(f"Authenticated as {me.get('display_name', me['id'])}")
 
+    manifest = {}
+    if os.path.exists(MANIFEST):
+        manifest = json.load(open(MANIFEST))
+
     albums = [d for d in os.listdir(EXTRACT)
               if os.path.isdir(os.path.join(EXTRACT, d))]
     for album_dir in tqdm(albums, desc="Albums", unit="album"):
@@ -318,6 +330,7 @@ def spotify_step():
         if " - " in album_title:
             album_title = album_title.split(" - ", 1)[1]
         album_title = album_title.strip()
+        name = f"KGATLW - {album_title}"
 
         audio_files = [os.path.join(r, f)
                        for r, _d, fs in os.walk(folder) for f in fs
@@ -326,26 +339,33 @@ def spotify_step():
                       for r, _d, fs in os.walk(folder) for f in fs
                       if f.lower() == "cover.jpg"), None)
 
-        playlist = spotify_api("POST", "/v1/me/playlists", token,
-                               json={"name": f"KGATLW - {album_title}",
-                                     "public": False})
-        pl_id = playlist["id"]
-        tqdm.write(f"\nCreated playlist: {playlist['name']}")
+        entry = manifest.get(album_dir)
+        if entry:
+            pl_id = entry["id"]
+            tqdm.write(f"\nUsing existing playlist: {name}")
+        else:
+            playlist = spotify_api("POST", "/v1/me/playlists", token,
+                                   json={"name": name, "public": False})
+            pl_id = playlist["id"]
+            entry = {"id": pl_id, "uris": []}
+            manifest[album_dir] = entry
+            tqdm.write(f"\nCreated playlist: {name}")
 
-        uris = []
-        for full in sorted(audio_files):
-            fname = os.path.basename(full)
-            track_title = parse_track_title(fname)
-            uri = search_track(token, track_title, album_title)
-            if uri:
-                uris.append(uri)
-            else:
-                tqdm.write(f"  ! no match: {track_title}")
-
-        for i in range(0, len(uris), 100):
-            spotify_api("POST", f"/v1/playlists/{pl_id}/items", token,
-                        json={"uris": uris[i:i + 100]})
-        tqdm.write(f"  added {len(uris)}/{len(audio_files)} tracks")
+        uris = entry["uris"] if entry.get("uris") else []
+        if not uris:
+            for full in sorted(audio_files):
+                track_title = parse_track_title(os.path.basename(full))
+                uri = search_track(token, track_title, album_title)
+                if uri:
+                    uris.append(uri)
+                else:
+                    tqdm.write(f"  ! no match: {track_title}")
+            if uris:
+                for i in range(0, len(uris), 100):
+                    spotify_api("POST", f"/v1/playlists/{pl_id}/items", token,
+                                json={"uris": uris[i:i + 100]})
+                entry["uris"] = uris
+        tqdm.write(f"  playlist has {len(uris)}/{len(audio_files)} matched tracks")
 
         if cover:
             img_b64 = inverted_cover_bytes(cover)
@@ -353,7 +373,241 @@ def spotify_step():
                          headers={"Authorization": f"Bearer {token}",
                                   "Content-Type": "image/jpeg"}).raise_for_status()
             tqdm.write(f"  uploaded inverted cover art")
+
+        with open(MANIFEST, "w") as f:
+            json.dump(manifest, f, indent=2)
     print("\nDone.")
+
+
+def get_playlist_items(token, playlist_id):
+    items = []
+    offset = 0
+    while True:
+        data = spotify_api("GET",
+                           f"/v1/playlists/{playlist_id}/items?limit=50&offset={offset}",
+                           token)
+        batch = data["items"]
+        items.extend(batch)
+        if data.get("next"):
+            offset += len(batch)
+        else:
+            break
+    return items
+
+
+def reorder_playlist(token, playlist_id, desired):
+    """Reorder a playlist so its tracks match `desired` (list of track URIs)."""
+    items = get_playlist_items(token, playlist_id)
+    cur = [it["item"]["uri"] for it in items]
+    if set(cur) != set(desired):
+        raise RuntimeError("Playlist items do not match the expected track set.")
+    pos = {u: i for i, u in enumerate(cur)}
+    for i, uri in enumerate(desired):
+        j = pos[uri]
+        if j == i:
+            continue
+        spotify_api("PUT", f"/v1/playlists/{playlist_id}/items", token,
+                    json={"range_start": j, "range_length": 1, "insert_before": i})
+        el = cur.pop(j)
+        cur.insert(i, el)
+        pos = {u: idx for idx, u in enumerate(cur)}
+
+
+def fetch_album_tracks(token, album_id):
+    uris = []
+    offset = 0
+    while True:
+        data = spotify_api("GET", f"/v1/albums/{album_id}/tracks?limit=50&offset={offset}", token)
+        batch = data["items"]
+        uris.extend(t["uri"] for t in batch)
+        if data.get("next"):
+            offset += len(batch)
+        else:
+            break
+    return uris
+
+
+def _norm(s):
+    return re.sub(r"[^a-z0-9]+", "", s.lower())
+
+
+def _folder_order(folder):
+    """Map normalized title -> official order index, from numbered filenames."""
+    order = {}
+    for name in sorted(os.listdir(folder)):
+        base = os.path.splitext(name)[0]
+        title = base
+        if " - " in base:
+            head, _, title = base.partition(" - ")
+        order.setdefault(_norm(title), [])
+        order[_norm(title)].append(base)
+    return order
+
+
+def _local_title(uri):
+    body = uri.replace("spotify:local:", "")
+    try:
+        _artist, _album, title, _length = body.split(":")
+    except ValueError:
+        return None
+    return title
+
+
+def _order_key(uri, folder_order):
+    if uri.startswith("spotify:local:"):
+        t = _local_title(uri)
+        return (0, "_".join(folder_order.get(_norm(t), []))) if t and _norm(t) in folder_order \
+            else (1, uri)
+    return (2, uri)
+
+
+def reorder_step():
+    load_dotenv()
+    if not os.path.exists(MANIFEST):
+        sys.exit(f"No {MANIFEST} manifest found. Run `spotify` first to create playlists.")
+    manifest = json.load(open(MANIFEST))
+    token, _ = spotify_token()
+    me = spotify_api("GET", "/v1/me", token)
+    print(f"Authenticated as {me.get('display_name', me['id'])}")
+    print(f"Reordering {len(manifest)} playlists from manifest.")
+
+    for album_dir, entry in tqdm(manifest.items(), desc="Albums", unit="album"):
+        pid = entry["id"]
+        folder = os.path.join(EXTRACT, album_dir)
+        folder_order = _folder_order(folder) if os.path.isdir(folder) else {}
+        try:
+            playlist = spotify_api("GET", f"/v1/playlists/{pid}?fields=name,items(total)", token)
+            items = get_playlist_items(token, pid)
+        except Exception as e:
+            tqdm.write(f"  ! skip '{album_dir}': {e}")
+            continue
+
+        # order local URIs by folder filename; catalog URIs by album tracklist
+        keyed = []
+        album_cache = {}
+        for it in items:
+            uri = it["item"]["uri"]
+            if uri.startswith("spotify:local:"):
+                keyed.append((_order_key(uri, folder_order), uri))
+            else:
+                al = it["item"].get("album", {}).get("uri")
+                aid = al.split(":")[-1] if al else None
+                if aid and aid not in album_cache:
+                    album_cache[aid] = fetch_album_tracks(token, aid)
+                tracklist = album_cache.get(aid, [])
+                try:
+                    idx = tracklist.index(uri)
+                    keyed.append(((0, f"A{idx:05d}"), uri))
+                except ValueError:
+                    keyed.append(((1, uri), uri))
+
+        desired = [uri for _k, uri in sorted(keyed, key=lambda x: x[0])]
+        try:
+            reorder_playlist(token, pid, desired)
+            tqdm.write(f"  reordered '{playlist['name']}' to album order")
+        except Exception as e:
+            tqdm.write(f"  ! reorder failed '{playlist['name']}': {e}")
+    print("\nDone.")
+
+
+def _parse_filename_number(name):
+    """Extract (disc, track) from a filename like 'NN - Title' or 'D-NN - Title'."""
+    base = os.path.splitext(os.path.basename(name))[0]
+    head = base.partition(" - ")[0].strip()
+    disc, track = 1, None
+    m = re.fullmatch(r"(\d+)[-_](\d+)", head)
+    if m:
+        disc, track = int(m.group(1)), int(m.group(2))
+    elif re.fullmatch(r"\d+", head):
+        track = int(head)
+    return disc, track
+
+
+def _read_cover(folder):
+    for name in ("cover.jpg", "cover.png", "cover.jpeg", "folder.jpg"):
+        path = os.path.join(folder, name)
+        if os.path.exists(path):
+            with open(path, "rb") as f:
+                data = f.read()
+            mime = "image/png" if name.endswith("png") else "image/jpeg"
+            return data, mime
+    return None, None
+
+
+def _embed_art(aud, ext, data, mime):
+    if not data:
+        return
+    if ext in (".flac", ".ogg"):
+        from mutagen.flac import Picture
+        pic = Picture()
+        pic.type = 3
+        pic.mime = mime
+        pic.desc = "cover"
+        pic.data = data
+        aud.add_picture(pic)
+    elif ext in (".mp3", ".m4a"):
+        from mutagen.id3 import APIC
+        aud.add(APIC(encoding=3, mime=mime, type=3, desc="cover", data=data))
+
+
+def fix_tags(path, title, album, artist, disc, track, total_tracks, total_discs, art=()):
+    ext = os.path.splitext(path)[1].lower()
+    art_data, art_mime = art
+    if ext in (".flac", ".ogg"):
+        from mutagen.flac import FLAC
+        from mutagen import FLACNoHeaderError  # noqa
+        aud = FLAC(path)
+        aud["tracknumber"] = [str(track)]
+        aud["totaltracks"] = [str(total_tracks)]
+        aud["discnumber"] = [str(disc)]
+        aud["totaldiscs"] = [str(total_discs)]
+        _embed_art(aud, ext, art_data, art_mime)
+        aud.save()
+        return
+    if ext in (".mp3", ".m4a"):
+        from mutagen.mp3 import MP3
+        from mutagen.id3 import ID3, TRCK, TPOS
+        aud = MP3(path)
+        tags = aud.tags if aud.tags is not None else ID3()
+        tags.add(TRCK(encoding=3, text=[f"{track}/{total_tracks}"]))
+        tags.add(TPOS(encoding=3, text=[f"{disc}/{total_discs}"]))
+        _embed_art(tags, ext, art_data, art_mime)
+        aud.tags = tags
+        aud.save()
+        return
+    raise ValueError(f"Unsupported audio format: {ext}")
+
+
+def metafix_step():
+    AUDIO = (".mp3", ".flac", ".m4a", ".ogg", ".wav", ".aiff")
+    if not os.path.isdir(EXTRACT):
+        sys.exit(f"No {EXTRACT} folder found.")
+    folders = [d for d in sorted(os.listdir(EXTRACT))
+               if os.path.isdir(os.path.join(EXTRACT, d))]
+    fixed = 0
+    for album_dir in folders:
+        folder = os.path.join(EXTRACT, album_dir)
+        audio = [f for f in os.listdir(folder) if os.path.splitext(f)[1].lower() in AUDIO]
+        if not audio:
+            continue
+        album, artist = album_dir.split(" - ", 1) if " - " in album_dir else (album_dir, album_dir)
+        disc_nums = {_parse_filename_number(f)[0] for f in audio}
+        total_discs = max(disc_nums) if disc_nums else 1
+        art = _read_cover(folder)
+        for name in sorted(audio):
+            disc, track = _parse_filename_number(name)
+            if track is None:
+                continue
+            path = os.path.join(folder, name)
+            title = os.path.splitext(name)[0]
+            title = title.partition(" - ")[2] if " - " in title else title
+            try:
+                fix_tags(path, title, album, artist, disc, track, len(audio), total_discs, art)
+                fixed += 1
+            except Exception as e:
+                print(f"  ! {album_dir}/{name}: {e}")
+        print(f"metafix: {album_dir} ({len(audio)} files)")
+    print(f"\nMetafix complete: {fixed} files updated.")
 
 
 # --------------------------------------------------------------------------- #
@@ -363,15 +617,22 @@ def main():
     sub = parser.add_subparsers(dest="step", required=True)
     sub.add_parser("download", help="fetch, zip and extract every album")
     sub.add_parser("spotify", help="create playlists from extracted albums")
+    sub.add_parser("reorder", help="reorder KGATLW playlists to official album order")
+    sub.add_parser("metafix", help="repair track/disc number + embed cover tags on extracted files (runs automatically after download; also callable standalone)")
     args = parser.parse_args()
 
     if args.step == "download":
         download_step()
         zip_step()
         extract_step()
+        metafix_step()
         shutil.rmtree(WORK, ignore_errors=True)
     elif args.step == "spotify":
         spotify_step()
+    elif args.step == "reorder":
+        reorder_step()
+    elif args.step == "metafix":
+        metafix_step()
 
 
 if __name__ == "__main__":
