@@ -225,6 +225,7 @@ def authorize():
         "code_challenge_method": "S256",
         "code_challenge": challenge,
         "scope": SCOPES,
+        "show_dialog": "true",
     }))
     print("Open this URL and authorise the app:\n" + auth_url)
 
@@ -307,8 +308,7 @@ def spotify_step():
         sys.exit(f"No extracted albums found in {EXTRACT}. Run `download` first.")
     token, _ = spotify_token()
     me = spotify_api("GET", "/v1/me", token)
-    user_id = me["id"]
-    print(f"Authenticated as {me.get('display_name', user_id)}")
+    print(f"Authenticated as {me.get('display_name', me['id'])}")
 
     albums = [d for d in os.listdir(EXTRACT)
               if os.path.isdir(os.path.join(EXTRACT, d))]
@@ -326,7 +326,7 @@ def spotify_step():
                       for r, _d, fs in os.walk(folder) for f in fs
                       if f.lower() == "cover.jpg"), None)
 
-        playlist = spotify_api("POST", f"/v1/users/{user_id}/playlists", token,
+        playlist = spotify_api("POST", "/v1/me/playlists", token,
                                json={"name": f"KGATLW - {album_title}",
                                      "public": False})
         pl_id = playlist["id"]
@@ -343,7 +343,7 @@ def spotify_step():
                 tqdm.write(f"  ! no match: {track_title}")
 
         for i in range(0, len(uris), 100):
-            spotify_api("POST", f"/v1/playlists/{pl_id}/tracks", token,
+            spotify_api("POST", f"/v1/playlists/{pl_id}/items", token,
                         json={"uris": uris[i:i + 100]})
         tqdm.write(f"  added {len(uris)}/{len(audio_files)} tracks")
 

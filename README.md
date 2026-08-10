@@ -54,11 +54,15 @@ The Spotify step:
 
 ## Limitations
 
-- **Local files cannot be added via the Spotify Web API.** Playlists are instead
-  populated by matching each track to Spotify's catalogue (they can't reference
-  the downloaded local files).
+- **Local files cannot be added via the Spotify Web API.** The `spotify` step
+  only works for tracks that resolve against Spotify's streaming catalogue; any
+  unmatched tracks are skipped (printed as `! no match`) and the rest still form
+  a playlist. Local-file playlists must be built manually in the desktop app:
+  Settings → Local Files → add `~/Music` as a source → drag tracks into a playlist.
 - Development-mode Spotify apps require the **app owner to have a Premium
   account** to function; non-allowlisted users get `403 Forbidden`.
+- Uses the post-Feb-2026 API: playlist creation via `POST /me/playlists`, adding
+  items via `POST /playlists/{id}/items`.
 
 ## Layout
 
