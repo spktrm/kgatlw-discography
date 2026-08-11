@@ -1,24 +1,18 @@
 #!/usr/bin/env python
 """Download King Gizzard & The Lizard Wizard's entire Bandcamp discography,
-package each album as a .zip, extract the zips, and (optionally) build a
-matching Spotify playlist per album.
+package each album as a .zip, extract the zips, and take charge of the matching
+Spotify playlists once the local files have been imported by hand.
 
 Usage:
-    python download_discography.py download                  # download + zip + extract + metafix
-    python download_discography.py spotify                   # build Spotify playlists from extracted albums
-    python download_discography.py reorder                   # reorder manifest playlists to official album order
-    python download_discography.py organize                  # name + order + set cover on hand-imported local-files playlists
-    python download_discography.py metafix                   # repair tags + embed cover on extracted files
+    python download_discography.py download    # download + zip + extract + metafix
+    python download_discography.py organize    # name + order + set cover on hand-imported playlists
+    python download_discography.py metafix     # repair tags + embed cover on extracted files
 
 Spotify needs these env vars: SPOTIFY_CLIENT_ID, SPOTIFY_CLIENT_SECRET
-Your playlists get a colour-inverted version of the album art as their cover so
-Spotify doesn't reject it as a duplicate of their internal artwork.
 
-NOTE: The Spotify Web API cannot add local files to playlists — playlists are
-populated by matching each album's tracks to the Spotify catalogue instead.
-If you import the files into Spotify yourself (one playlist per album), use
-`organize` to name each playlist after its album, order the tracks, and set the
-album's cover art.
+NOTE: The Spotify Web API cannot add local files to playlists, so importing the
+files into Spotify (one playlist per album) is a manual step. `organize` then
+names each playlist after its album, orders the tracks, and sets the album art.
 """
 
 import argparse
@@ -39,7 +33,7 @@ from urllib.parse import urlencode
 from urllib.request import urlopen, Request
 
 import requests
-from PIL import Image, ImageOps
+from PIL import Image
 from tqdm import tqdm
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -51,13 +45,11 @@ from bandcamp_dl.bandcamp import Bandcamp
 from bandcamp_dl.bandcampdownloader import BandcampDownloader
 
 ARTIST = "kinggizzard"
-ARTIST_NAME = "King Gizzard & The Lizard Wizard"
 WORK = os.path.join(HERE, ".tmp")
 HIGH_WATER = os.path.join(WORK, ".downloaded.json")
 DEST = os.path.join(HERE, "Raw")
 EXTRACT = os.path.join(HERE, "Extracted")
 SPOTIFY_TOKEN = os.path.join(HERE, ".spotify_token.json")
-MANIFEST = os.path.join(HERE, ".playlists.json")
 REDIRECT_PORT = 8888
 REDIRECT_URI = f"http://127.0.0.1:{REDIRECT_PORT}/callback"
 SCOPES = "playlist-modify-private playlist-modify-public playlist-read-private ugc-image-upload"
@@ -276,115 +268,6 @@ def spotify_api(method, path, token, **kw):
     return r.json() if r.content else None
 
 
-def inverted_cover_bytes(cover_path, max_bytes=256 * 1024):
-    img = Image.open(cover_path).convert("RGB")
-    inv = ImageOps.invert(img)
-    for size in (640, 512, 384, 300):
-        im = inv.copy()
-        im.thumbnail((size, size))
-        for quality in (80, 65, 50, 35):
-            buf = io.BytesIO()
-            im.save(buf, format="JPEG", quality=quality)
-            if buf.tell() < max_bytes:
-                return base64.b64encode(buf.getvalue())
-    buf = io.BytesIO()
-    inv.resize((300, 300)).save(buf, "JPEG", quality=30)
-    return base64.b64encode(buf.getvalue())
-
-
-def search_track(token, title, album):
-    album_q = album.replace('"', "\\\"")
-    title_q = title.replace('"', "\\\"")
-    q = f'track:"{title_q}" album:"{album_q}" artist:"{ARTIST_NAME}"'
-    data = spotify_api("GET",
-                       "/v1/search?" + urlencode({"q": q, "type": "track", "limit": 1}),
-                       token)
-    items = data.get("tracks", {}).get("items", [])
-    if not items:
-        q2 = f'track:"{title_q}" artist:"{ARTIST_NAME}"'
-        data = spotify_api("GET",
-                           "/v1/search?" + urlencode({"q": q2, "type": "track", "limit": 1}),
-                           token)
-        items = data.get("tracks", {}).get("items", [])
-    return items[0]["uri"] if items else None
-
-
-def parse_track_title(fname):
-    title = fname.rsplit(".", 1)[0]
-    if " - " in title:
-        title = title.rsplit(" - ", 1)[1]
-    return re.sub(r"^\d+\s+", "", title.strip()).strip()
-
-
-def spotify_step():
-    load_dotenv()
-    if not os.path.isdir(EXTRACT):
-        sys.exit(f"No extracted albums found in {EXTRACT}. Run `download` first.")
-    token, _ = spotify_token()
-    me = spotify_api("GET", "/v1/me", token)
-    print(f"Authenticated as {me.get('display_name', me['id'])}")
-
-    manifest = {}
-    if os.path.exists(MANIFEST):
-        manifest = json.load(open(MANIFEST))
-
-    albums = [d for d in os.listdir(EXTRACT)
-              if os.path.isdir(os.path.join(EXTRACT, d))]
-    for album_dir in tqdm(albums, desc="Albums", unit="album"):
-        folder = os.path.join(EXTRACT, album_dir)
-        album_title = album_dir.replace("; or-", "; or", 1)
-        if " - " in album_title:
-            album_title = album_title.split(" - ", 1)[1]
-        album_title = album_title.strip()
-        name = f"KGATLW - {album_title}"
-
-        audio_files = [os.path.join(r, f)
-                       for r, _d, fs in os.walk(folder) for f in fs
-                       if f.lower().endswith((".mp3", ".flac"))]
-        cover = next((os.path.join(r, f)
-                      for r, _d, fs in os.walk(folder) for f in fs
-                      if f.lower() == "cover.jpg"), None)
-
-        entry = manifest.get(album_dir)
-        if entry:
-            pl_id = entry["id"]
-            tqdm.write(f"\nUsing existing playlist: {name}")
-        else:
-            playlist = spotify_api("POST", "/v1/me/playlists", token,
-                                   json={"name": name, "public": False})
-            pl_id = playlist["id"]
-            entry = {"id": pl_id, "uris": []}
-            manifest[album_dir] = entry
-            tqdm.write(f"\nCreated playlist: {name}")
-
-        uris = entry["uris"] if entry.get("uris") else []
-        if not uris:
-            for full in sorted(audio_files):
-                track_title = parse_track_title(os.path.basename(full))
-                uri = search_track(token, track_title, album_title)
-                if uri:
-                    uris.append(uri)
-                else:
-                    tqdm.write(f"  ! no match: {track_title}")
-            if uris:
-                for i in range(0, len(uris), 100):
-                    spotify_api("POST", f"/v1/playlists/{pl_id}/items", token,
-                                json={"uris": uris[i:i + 100]})
-                entry["uris"] = uris
-        tqdm.write(f"  playlist has {len(uris)}/{len(audio_files)} matched tracks")
-
-        if cover:
-            img_b64 = inverted_cover_bytes(cover)
-            requests.put(f"{API}/v1/playlists/{pl_id}/images", data=img_b64,
-                         headers={"Authorization": f"Bearer {token}",
-                                  "Content-Type": "image/jpeg"}).raise_for_status()
-            tqdm.write(f"  uploaded inverted cover art")
-
-        with open(MANIFEST, "w") as f:
-            json.dump(manifest, f, indent=2)
-    print("\nDone.")
-
-
 def get_playlist_items(token, playlist_id):
     items = []
     offset = 0
@@ -419,20 +302,6 @@ def reorder_playlist(token, playlist_id, desired):
         pos = {u: idx for idx, u in enumerate(cur)}
 
 
-def fetch_album_tracks(token, album_id):
-    uris = []
-    offset = 0
-    while True:
-        data = spotify_api("GET", f"/v1/albums/{album_id}/tracks?limit=50&offset={offset}", token)
-        batch = data["items"]
-        uris.extend(t["uri"] for t in batch)
-        if data.get("next"):
-            offset += len(batch)
-        else:
-            break
-    return uris
-
-
 def _norm(s):
     return re.sub(r"[^a-z0-9]+", "", s.lower())
 
@@ -465,55 +334,6 @@ def _order_key(uri, folder_order):
         return (0, "_".join(folder_order.get(_norm(t), []))) if t and _norm(t) in folder_order \
             else (1, uri)
     return (2, uri)
-
-
-def reorder_step():
-    load_dotenv()
-    if not os.path.exists(MANIFEST):
-        sys.exit(f"No {MANIFEST} manifest found. Run `spotify` first to create playlists.")
-    manifest = json.load(open(MANIFEST))
-    token, _ = spotify_token()
-    me = spotify_api("GET", "/v1/me", token)
-    print(f"Authenticated as {me.get('display_name', me['id'])}")
-    print(f"Reordering {len(manifest)} playlists from manifest.")
-
-    for album_dir, entry in tqdm(manifest.items(), desc="Albums", unit="album"):
-        pid = entry["id"]
-        folder = os.path.join(EXTRACT, album_dir)
-        folder_order = _folder_order(folder) if os.path.isdir(folder) else {}
-        try:
-            playlist = spotify_api("GET", f"/v1/playlists/{pid}?fields=name,items(total)", token)
-            items = get_playlist_items(token, pid)
-        except Exception as e:
-            tqdm.write(f"  ! skip '{album_dir}': {e}")
-            continue
-
-        # order local URIs by folder filename; catalog URIs by album tracklist
-        keyed = []
-        album_cache = {}
-        for it in items:
-            uri = it["item"]["uri"]
-            if uri.startswith("spotify:local:"):
-                keyed.append((_order_key(uri, folder_order), uri))
-            else:
-                al = it["item"].get("album", {}).get("uri")
-                aid = al.split(":")[-1] if al else None
-                if aid and aid not in album_cache:
-                    album_cache[aid] = fetch_album_tracks(token, aid)
-                tracklist = album_cache.get(aid, [])
-                try:
-                    idx = tracklist.index(uri)
-                    keyed.append(((0, f"A{idx:05d}"), uri))
-                except ValueError:
-                    keyed.append(((1, uri), uri))
-
-        desired = [uri for _k, uri in sorted(keyed, key=lambda x: x[0])]
-        try:
-            reorder_playlist(token, pid, desired)
-            tqdm.write(f"  reordered '{playlist['name']}' to album order")
-        except Exception as e:
-            tqdm.write(f"  ! reorder failed '{playlist['name']}': {e}")
-    print("\nDone.")
 
 
 def _parse_filename_number(name):
@@ -628,12 +448,12 @@ def upload_cover(token, pid, folder):
 
 
 def organize_step():
-    """Title and reorder playlists that the user imported manually (as local files).
+    """Name, order, and set cover on playlists the user imported manually.
 
     The Web API can't add local files, so the user has to import them by hand as a
-    playlist per album. This step finds those playlists (ones containing only
+    playlist per album. This step finds those playlists (ones containing
     `spotify:local:` tracks), figures out which album each matches by comparing the
-    track titles against the extracted folder, renames it `KGATLW - <Album>`, and
+    track titles against the extracted folder, renames it to the album title, and
     reorders it to the official album order.
     """
     load_dotenv()
@@ -694,9 +514,7 @@ def organize_step():
             if best is None or (hits, -extra) > (best_hits, -best_extra):
                 best, best_hits, best_extra = album_dir, hits, extra
         if best is None or not best_hits:
-            print(f"  ! no matching album for '{pl['name']}' ({len(local)} local tracks) "
-                  f"- leaving as-is")
-            continue
+            continue  # not one of our albums — leave unrelated playlists untouched
 
         album_title = best.replace("; or-", "; or", 1)
         album_title = album_title.split(" - ", 1)[1].strip() if " - " in album_title else album_title.strip()
@@ -764,9 +582,7 @@ def main():
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="step", required=True)
     sub.add_parser("download", help="fetch, zip and extract every album")
-    sub.add_parser("spotify", help="create playlists from extracted albums")
-    sub.add_parser("reorder", help="reorder KGATLW playlists to official album order")
-    sub.add_parser("organize", help="title + reorder playlists you imported manually as local files (one per album)")
+    sub.add_parser("organize", help="title + order + set cover on playlists you imported manually as local files (one per album)")
     sub.add_parser("metafix", help="repair track/disc number + embed cover tags on extracted files (runs automatically after download; also callable standalone)")
     args = parser.parse_args()
 
@@ -776,10 +592,6 @@ def main():
         extract_step()
         metafix_step()
         shutil.rmtree(WORK, ignore_errors=True)
-    elif args.step == "spotify":
-        spotify_step()
-    elif args.step == "reorder":
-        reorder_step()
     elif args.step == "organize":
         organize_step()
     elif args.step == "metafix":
