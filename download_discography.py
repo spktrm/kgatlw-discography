@@ -4,8 +4,11 @@ package each album as a .zip, extract the zips, and (optionally) build a
 matching Spotify playlist per album.
 
 Usage:
-    python download_discography.py download                  # download + zip + extract
+    python download_discography.py download                  # download + zip + extract + metafix
     python download_discography.py spotify                   # build Spotify playlists from extracted albums
+    python download_discography.py reorder                   # reorder manifest playlists to official album order
+    python download_discography.py organize                  # name + order + set cover on hand-imported local-files playlists
+    python download_discography.py metafix                   # repair tags + embed cover on extracted files
 
 Spotify needs these env vars: SPOTIFY_CLIENT_ID, SPOTIFY_CLIENT_SECRET
 Your playlists get a colour-inverted version of the album art as their cover so
@@ -13,6 +16,9 @@ Spotify doesn't reject it as a duplicate of their internal artwork.
 
 NOTE: The Spotify Web API cannot add local files to playlists — playlists are
 populated by matching each album's tracks to the Spotify catalogue instead.
+If you import the files into Spotify yourself (one playlist per album), use
+`organize` to name each playlist after its album, order the tracks, and set the
+album's cover art.
 """
 
 import argparse
@@ -54,7 +60,7 @@ SPOTIFY_TOKEN = os.path.join(HERE, ".spotify_token.json")
 MANIFEST = os.path.join(HERE, ".playlists.json")
 REDIRECT_PORT = 8888
 REDIRECT_URI = f"http://127.0.0.1:{REDIRECT_PORT}/callback"
-SCOPES = "playlist-modify-private playlist-read-private ugc-image-upload"
+SCOPES = "playlist-modify-private playlist-modify-public playlist-read-private ugc-image-upload"
 TOKEN_URL = "https://accounts.spotify.com/api/token"
 API = "https://api.spotify.com"
 
@@ -578,6 +584,148 @@ def fix_tags(path, title, album, artist, disc, track, total_tracks, total_discs,
     raise ValueError(f"Unsupported audio format: {ext}")
 
 
+def _find_cover(folder):
+    for name in ("cover.jpg", "cover.png", "cover.jpeg", "folder.jpg"):
+        path = os.path.join(folder, name)
+        if os.path.exists(path):
+            return path
+    return None
+
+
+def album_cover_bytes(cover_path, size=512, max_bytes=256 * 1024):
+    """Return a base64 JPEG of the cover, centre-cropped to a square of `size`.
+
+    Spotify caps playlist-image uploads at 256 KB, so the image is resized to a
+    512x512 square and saved at a quality that keeps it under the limit.
+    """
+    img = Image.open(cover_path).convert("RGB")
+    w, h = img.size
+    side = min(w, h)
+    img = img.crop(((w - side) // 2, (h - side) // 2,
+                    (w + side) // 2, (h + side) // 2))
+    img = img.resize((size, size), Image.LANCZOS)
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=85)
+    if buf.tell() < max_bytes:
+        return base64.b64encode(buf.getvalue())
+    for quality in (75, 60, 45, 30):
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=quality)
+        if buf.tell() < max_bytes:
+            return base64.b64encode(buf.getvalue())
+    return base64.b64encode(buf.getvalue())
+
+
+def upload_cover(token, pid, folder):
+    cover = _find_cover(folder)
+    if not cover:
+        return False
+    img_b64 = album_cover_bytes(cover)
+    requests.put(f"{API}/v1/playlists/{pid}/images", data=img_b64,
+                 headers={"Authorization": f"Bearer {token}",
+                          "Content-Type": "image/jpeg"}).raise_for_status()
+    return True
+
+
+def organize_step():
+    """Title and reorder playlists that the user imported manually (as local files).
+
+    The Web API can't add local files, so the user has to import them by hand as a
+    playlist per album. This step finds those playlists (ones containing only
+    `spotify:local:` tracks), figures out which album each matches by comparing the
+    track titles against the extracted folder, renames it `KGATLW - <Album>`, and
+    reorders it to the official album order.
+    """
+    load_dotenv()
+    if not os.path.isdir(EXTRACT):
+        sys.exit(f"No extracted albums found in {EXTRACT} to derive ordering from. "
+                 "Run `download` first.")
+    token, _ = spotify_token()
+    me = spotify_api("GET", "/v1/me", token)
+    print(f"Authenticated as {me.get('display_name', me['id'])}")
+
+    # Index normalised local-title -> (album dir, filenames seen), so we can match
+    # each hand-imported playlist to the album it came from.
+    index = {}
+    for album_dir in os.listdir(EXTRACT):
+        folder = os.path.join(EXTRACT, album_dir)
+        if not os.path.isdir(folder):
+            continue
+        order = _folder_order(folder)
+        for norm in order:
+            index.setdefault(norm, (album_dir, order))
+
+    playlists = []
+    offset = 0
+    while True:
+        data = spotify_api("GET", f"/v1/me/playlists?limit=50&offset={offset}", token)
+        playlists.extend(data["items"])
+        if data.get("next"):
+            offset = len(playlists)
+        else:
+            break
+
+    updated = renamed = 0
+    for pl in playlists:
+        pid = pl["id"]
+        if pl["owner"]["id"] != me["id"]:
+            continue
+        try:
+            items = get_playlist_items(token, pid)
+        except Exception as e:
+            print(f"  ! skip '{pl['name']}': {e}")
+            continue
+
+        local = [it["item"]["uri"] for it in items
+                 if it["item"]["uri"].startswith("spotify:local:")]
+        if not local:
+            continue  # not a hand-imported local-files playlist
+
+        titles = {_norm(t) for t in (_local_title(u) for u in local) if t}
+        if not titles:
+            print(f"  ! '{pl['name']}' has unreadable local tracks, skipping")
+            continue
+
+        # Pick the album whose folder filenames match the most tracks.
+        best = best_hits = best_extra = None
+        for album_dir, order in index.values():
+            hits = sum(1 for t in titles if t in order)
+            extra = len(titles - set(order))
+            if best is None or (hits, -extra) > (best_hits, -best_extra):
+                best, best_hits, best_extra = album_dir, hits, extra
+        if best is None or not best_hits:
+            print(f"  ! no matching album for '{pl['name']}' ({len(local)} local tracks) "
+                  f"- leaving as-is")
+            continue
+
+        album_title = best.replace("; or-", "; or", 1)
+        album_title = album_title.split(" - ", 1)[1].strip() if " - " in album_title else album_title.strip()
+        name = album_title
+
+        folder = os.path.join(EXTRACT, best)
+        fold = _folder_order(folder)
+        desired = [u for _k, u in sorted(((_order_key(u, fold), u) for u in local),
+                                         key=lambda x: x[0])]
+
+        try:
+            if pl["name"] != name:
+                spotify_api("PUT", f"/v1/playlists/{pid}", token,
+                            json={"name": name, "public": False})
+                print(f"  renamed '{pl['name']}' -> '{name}'")
+                renamed += 1
+            reorder_playlist(token, pid, desired)
+            updated += 1
+            if upload_cover(token, pid, folder):
+                print(f"  updated cover for '{name}'")
+            print(f"  ordered '{name}' ({len(local)} tracks)")
+        except RuntimeError as e:
+            print(f"  ! reorder failed for '{name}': {e}")
+        except Exception as e:
+            print(f"  ! failed for '{name}': {e}")
+
+    print(f"\nDone. Named {renamed} and ordered {updated} manually-imported playlists.")
+
+
 def metafix_step():
     AUDIO = (".mp3", ".flac", ".m4a", ".ogg", ".wav", ".aiff")
     if not os.path.isdir(EXTRACT):
@@ -618,6 +766,7 @@ def main():
     sub.add_parser("download", help="fetch, zip and extract every album")
     sub.add_parser("spotify", help="create playlists from extracted albums")
     sub.add_parser("reorder", help="reorder KGATLW playlists to official album order")
+    sub.add_parser("organize", help="title + reorder playlists you imported manually as local files (one per album)")
     sub.add_parser("metafix", help="repair track/disc number + embed cover tags on extracted files (runs automatically after download; also callable standalone)")
     args = parser.parse_args()
 
@@ -631,6 +780,8 @@ def main():
         spotify_step()
     elif args.step == "reorder":
         reorder_step()
+    elif args.step == "organize":
+        organize_step()
     elif args.step == "metafix":
         metafix_step()
 
